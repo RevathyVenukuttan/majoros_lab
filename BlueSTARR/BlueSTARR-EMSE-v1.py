@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #========================================================================
-# BlueSTARR-multitask Version 0.1 (uncertainty-aware, single-output)
+# BlueSTARR-multitask Version 0.1
 #
 # Adapted from DeepSTARR by Bill Majoros (bmajoros@alumni.duke.edu)
 # and Alexander Thomson.
@@ -13,13 +13,11 @@ import keras
 import keras.layers as kl
 from keras.layers import Conv1D, MaxPooling1D, AveragePooling1D
 from keras.layers import Dropout, Reshape, Dense, Activation, Flatten
-from keras.layers import BatchNormalization, Input, LSTM, GRU, Bidirectional
-from keras.layers import Add, Concatenate, LayerNormalization, MultiHeadAttention
+from keras.layers import BatchNormalization, InputLayer, Input, LSTM, GRU, Bidirectional, Add, Concatenate, LayerNormalization, MultiHeadAttention
 import keras_nlp
 from keras_nlp.layers import SinePositionEncoding, TransformerEncoder, RotaryEmbedding
 from keras import models
 from keras.models import Sequential, Model
-from keras.initializers import Constant
 from keras.optimizers import Adam
 from keras.callbacks import EarlyStopping, History, ModelCheckpoint
 import keras.backend as backend
@@ -41,9 +39,9 @@ rex = Rex()
 #                                GLOBALS
 #========================================================================
 config = None
-NUM_DNA = None  # list: numbers of DNA replicates per task
-NUM_RNA = None  # list: numbers of RNA replicates per task
-EPSILON = tf.cast(1e-10, tf.float32)
+NUM_DNA = None  # array: numbers of DNA replicates in each cell type
+NUM_RNA = None  # array: numbers of RNA replicates in each cell type
+EPSILON = tf.cast(1e-10, tf.float32)  # used as alpha prior in custom loss
 
 
 #=========================================================================
@@ -52,6 +50,7 @@ EPSILON = tf.cast(1e-10, tf.float32)
 def main(configFile, subdir, modelFilestem):
     startTime = time.time()
 
+    # Load hyperparameters from configuration file
     global config
     config = NeuralConfig(configFile)
 
@@ -72,16 +71,15 @@ def main(configFile, subdir, modelFilestem):
     model.summary()
 
     # Train
-    if config.Epochs > 0:
+    history = None
+    if (config.Epochs > 0):
         print("Training...", flush=True)
         print("Training set:", X_train.shape)
         (model, history) = train(model, X_train, Y_train, X_valid, Y_valid)
+        print(history.history)
         print("Done training", flush=True)
         print("loss", history.history['loss'])
         print("val_loss", history.history['val_loss'])
-        print('Min validation loss:', round(min(history.history['val_loss']), 4))
-    else:
-        history = None
 
     # Save model to a file
     model_json = model.to_json()
@@ -90,176 +88,155 @@ def main(configFile, subdir, modelFilestem):
     model.save_weights(modelFilestem + ".h5")
 
     # Test and report accuracy
-    if config.ShouldTest != 0:
+    if (config.ShouldTest != 0):
         numTasks = len(config.Tasks)
         for i in range(numTasks):
-            summary_statistics(
-                X_test, Y_test, "Test", i, numTasks,
-                config.Tasks[i], model, idx_test, modelFilestem
-            )
+            summary_statistics(X_test, Y_test, "Test", i, numTasks,
+                               config.Tasks[i], model, idx_test, modelFilestem)
+
+    if history is not None:
+        print('Min validation loss:', round(min(history.history['val_loss']), 4))
 
     # Report elapsed time
     endTime = time.time()
-    minutes = (endTime - startTime) / 60.0
+    seconds = endTime - startTime
+    minutes = seconds / 60
     print("Elapsed time:", round(minutes, 2), "minutes")
 
 
-#=========================================================================
-#                         Evaluation helpers
-#=========================================================================
-def summary_statistics(X, Y, setName, taskNum, numTasks, taskName,
-                       model, idx, modelFilestem):
-  
-    if X is None:
-        return
-
+def summary_statistics(X, Y, set, taskNum, numTasks, taskName, model, idx, modelFilestem):
     pred = model.predict(X, batch_size=config.BatchSize)
-    # pred shape: (N, 2*numTasks)
-    mu_pred = pred[:, 2 * taskNum]
-    var_pred_raw = pred[:, 2 * taskNum + 1]
-    var_pred = np.asarray(tf.nn.softplus(var_pred_raw) + 1e-6)
 
-    if config.useCustomLoss:
-        naiveTheta, y_true_log, cor, SE = naiveCorrelation(Y, mu_pred, taskNum)
-        df = pd.DataFrame({
-            'idx': idx,
-            'true': y_true_log,
-            'mu_pred': mu_pred,
-            'SE': SE,
-            'var_pred': var_pred
-        })
-        corr_sigma = spearmanr(np.abs(df['mu_pred'] - df['true']), df['var_pred'])
-        mse = np.mean((df['true'] - df['mu_pred']) ** 2)
-        df.to_csv(modelFilestem + f'.task{taskNum}.txt', index=False, sep='\t')
-        print(taskName + " predicted theta rho=", cor.statistic, "p=", cor.pvalue)
-        print("Correlation between error and sigma²=",
-              corr_sigma.statistic, "p=", corr_sigma.pvalue)
-        print(taskName + ' predicted theta mse=', mse)
+    if (config.useCustomLoss):
+        # naiveTheta: normal scale, pred: log scale
+        naiveTheta, cor = naiveCorrelation(Y, pred, taskNum, numTasks)
+        df = pd.DataFrame({'idx': idx, 'true': tf.math.log(naiveTheta), 'predicted': pred.squeeze()})  # log scale
+        mse = np.mean((df['true'] - df['predicted']) ** 2)
     else:
-        # fallback for non-custom loss (single-head old behavior)
-        pred_exp = tf.math.exp(pred.squeeze())
-        Y_exp = tf.math.exp(Y)
-        cor = stats.spearmanr(pred_exp.numpy().ravel(), Y_exp.numpy().ravel())
-        df = pd.DataFrame({'idx': idx,
-                           'true': Y.numpy().ravel(),
-                           'mu_pred': pred_exp.numpy().ravel()})
-        mse = np.mean((df['true'] - df['mu_pred']) ** 2)
-        df.to_csv(modelFilestem + '.txt', index=False, sep='\t')
-        print(taskName + " predicted theta rho=", cor.statistic, "p=", cor.pvalue)
-        print(taskName + ' predicted theta mse=', mse)
+        cor = stats.spearmanr(tf.math.exp(pred.squeeze()), tf.math.exp(Y))
+        df = pd.DataFrame({'idx': idx, 'true': Y.numpy().ravel(), 'predicted': pred.squeeze()})
+        mse = np.mean((df['true'] - df['predicted']) ** 2)
+
+    print(taskName + " rho=", cor.statistic, "p=", cor.pvalue)
+    print(taskName + ' mse=', mse)
 
 
-def naiveCorrelation(y_true, mu_pred, taskNum):
-    """
-    Compute naive theta, log naive theta, SE = (mu - log(theta_naive))^2,
-    and Spearman correlation between exp(mu) and naive theta.
-    """
-    global NUM_DNA, NUM_RNA
-
-    if isinstance(y_true, tf.Tensor):
-        y_true = y_true.numpy()
-    y_true = np.asarray(y_true)
-
+def naiveCorrelation(y_true, y_pred, taskNum, numTasks):
     a = 0
     for i in range(taskNum):
         a += NUM_DNA[i] + NUM_RNA[i]
     b = a + NUM_DNA[taskNum]
     c = b + NUM_RNA[taskNum]
-
-    DNA = y_true[:, a:b] + 1.0
-    RNA = y_true[:, b:c] + 1.0
-    sumX = np.sum(DNA, axis=1)
-    sumY = np.sum(RNA, axis=1)
-    naiveTheta = sumY / sumX
-    y_true_log = np.log(naiveTheta)
-
-    SE = np.square(mu_pred - y_true_log)
-    cor = stats.spearmanr(np.exp(mu_pred), naiveTheta)
-
-    return naiveTheta, y_true_log, cor, SE
+    DNA = y_true[:, a:b]
+    RNA = y_true[:, b:c]
+    avgX = tf.reduce_mean(DNA, axis=1)
+    avgY = tf.reduce_mean(RNA, axis=1)
+    naiveTheta = avgY / avgX
+    cor = None
+    if (numTasks == 1):
+        cor = stats.spearmanr(tf.math.exp(tf.squeeze(y_pred)), naiveTheta)
+    else:
+        # multi-output model returns list-like; keras may give array shaped (N, numTasks)
+        cor = stats.spearmanr(tf.math.exp(tf.squeeze(y_pred[taskNum])), naiveTheta)
+    return naiveTheta, cor
 
 
 #========================================================================
-#                          Generic helpers
+#                               FUNCTIONS
 #========================================================================
 def log(x):
     return tf.math.log(x)
+
+
+def exp(x):
+    return tf.math.exp(x)
 
 
 def logGam(x):
     return tf.math.lgamma(x)
 
 
-def logLik(sumX, numX, Yj, logTheta, alpha, beta, numRNA, sumDnaLibs, RnaLibs):
-    numX = 1  # changed on 10/2/2025
+# ---- NEW: Expected MSE loss term from summed counts ----
+def expected_mse_from_counts(sumX, sumY, y_pred_logtheta, alpha):
+    """
+    Expected squared error under beta-prime posterior for theta=lambda_R/lambda_D.
 
-    n = tf.shape(sumX)[0]
-    sumX = tf.tile(tf.reshape(sumX, [n, 1]), [1, numRNA])
+    sumX: (batch,) summed DNA counts across reps
+    sumY: (batch,) summed RNA counts across reps
+    y_pred_logtheta: (batch,1) or (batch,) model output in log(theta_hat)
+    alpha: scalar (prior)
+    """
+    a = tf.cast(alpha, tf.float32)
+    sumX = tf.cast(sumX, tf.float32)
+    sumY = tf.cast(sumY, tf.float32)
 
-    theta = tf.math.exp(logTheta)  # model predicts log(theta)
+    # model predicts log(theta_hat) -> convert to theta_hat
+    theta_hat = tf.exp(tf.cast(y_pred_logtheta, tf.float32))
 
-    n = tf.shape(sumDnaLibs)[0]
-    sumDnaLibs = tf.tile(tf.reshape(sumDnaLibs, [n, 1]), [1, numRNA])
-    libRatio = RnaLibs / sumDnaLibs
-    theta = theta * libRatio
+    # Need a + X - 2 > 0 for second moment and a + X - 1 > 0 for posterior mean
+    X_safe = tf.maximum(sumX, 2.0 - a + 1e-6)
 
-    LL = (sumX + alpha) * log(beta + numX) + \
-         logGam(Yj + sumX + alpha) + \
-         Yj * log(theta) - \
-         logGam(sumX + alpha) - \
-         logGam(Yj + 1) - \
-         (Yj + sumX + alpha) * log(theta + beta + numX)
+    # E*[theta]
+    mean_theta = (a + sumY) / (a + X_safe - 1.0)
 
-    reduced = tf.reduce_sum(LL, axis=1)  # sum logLik across iid replicates
-    return reduced
+    # E*[theta^2] computed stably using log-gamma
+    log_second_moment = (
+        tf.math.lgamma(a + sumY + 2.0)
+        + tf.math.lgamma(a + X_safe - 2.0)
+        - tf.math.lgamma(a + sumY)
+        - tf.math.lgamma(a + X_safe)
+    )
+    second_moment = tf.exp(log_second_moment)
+
+    return tf.square(theta_hat) - 2.0 * theta_hat * mean_theta + second_moment
 
 
-#=========================================================================
-#                      Uncertainty-aware custom loss
-#=========================================================================
 @tf.autograph.experimental.do_not_convert
+def makeClosure(taskNum):
+    """
+    Custom loss closure using ONLY DNA/RNA counts for the specified task:
+      y_true layout per task is: [DNA reps][RNA reps] ... (and possibly more cols)
+    We only slice DNA and RNA using NUM_DNA/NUM_RNA like mseClosure().
+    """
+    a = 0
+    for i in range(taskNum):
+        a += NUM_DNA[i] + NUM_RNA[i]
+    b = a + NUM_DNA[taskNum]
+    c = b + NUM_RNA[taskNum]
+
+    @tf.autograph.experimental.do_not_convert
+    def loss(y_true, y_pred):
+        global EPSILON  # used as alpha prior
+        DNA = y_true[:, a:b]
+        RNA = y_true[:, b:c]
+        sumX = tf.reduce_sum(DNA, axis=1)
+        sumY = tf.reduce_sum(RNA, axis=1)
+        return expected_mse_from_counts(sumX, sumY, y_pred, alpha=EPSILON)
+
+    return loss
+
+
 @tf.autograph.experimental.do_not_convert
-def uncertainty_loss(y_true, y_pred):
-    global NUM_DNA, NUM_RNA
-    numTasks = len(NUM_DNA)
+def mseClosure(taskNum):
+    a = 0
+    for i in range(taskNum):
+        a += NUM_DNA[i] + NUM_RNA[i]
+    b = a + NUM_DNA[taskNum]
+    c = b + NUM_RNA[taskNum]
 
-    losses_per_task = []
-    offset = 0
-
-    for t_idx in range(numTasks):
-        a = offset
-        b = a + NUM_DNA[t_idx]
-        c = b + NUM_RNA[t_idx]
-
-        DNA = y_true[:, a:b] + 1.0
-        RNA = y_true[:, b:c] + 1.0
+    @tf.autograph.experimental.do_not_convert
+    def loss(y_true, y_pred):
+        DNA = y_true[:, a:b] + 1
+        RNA = y_true[:, b:c] + 1
         sumX = tf.reduce_sum(DNA, axis=1)
         sumY = tf.reduce_sum(RNA, axis=1)
         naiveTheta = sumY / sumX
-        y_log = tf.math.log(naiveTheta)
+        mse = tf.math.reduce_mean(tf.math.square(y_pred - tf.math.log(naiveTheta)), axis=1)
+        return mse
 
-        mu      = y_pred[:, 2 * t_idx]          # (batch,)
-        raw_var = y_pred[:, 2 * t_idx + 1]      # (batch,)
-        var     = tf.nn.softplus(raw_var) + 1e-6
-
-        se = tf.square(mu - y_log)              # SE of mu-head
-
-        se_target = tf.stop_gradient(se)
-
-        loss_mu  = se                           # train mu normally
-        loss_var = tf.square(var - se_target)   # train var to match SE
-
-        losses_per_task.append(loss_mu + loss_var)
-
-        offset = c
-
-    total_loss = tf.add_n(losses_per_task)      # (batch,)
-    return total_loss
+    return loss
 
 
-#=========================================================================
-#                           Data loading helpers
-#=========================================================================
 def generate_complementary_sequence(sequence):
     comp_seq = []
     for b in sequence:
@@ -278,8 +255,7 @@ def generate_complementary_sequence(sequence):
     return ''.join(comp_seq)
 
 
-def loadFasta(fasta_path, as_dict=False, uppercase=False,
-              stop_at=None, revcomp=False):
+def loadFasta(fasta_path, as_dict=False, uppercase=False, stop_at=None, revcomp=False):
     fastas = []
     seq = None
     header = None
@@ -299,16 +275,20 @@ def loadFasta(fasta_path, as_dict=False, uppercase=False,
                 seq += r.upper() if uppercase else r
             else:
                 seq = r.upper() if uppercase else r
+
     if stop_at is not None and len(fastas) < stop_at:
         fastas.append([header, seq])
     elif stop_at is None:
         fastas.append([header, seq])
+
     if as_dict:
         return {h: s for h, s in fastas}
+
     if revcomp:
         for rec in fastas:
             rc = generate_complementary_sequence(rec[1])
             rec[1] = rec[1] + "NNNNNNNNNNNNNNNNNNNN" + rc
+
     return pd.DataFrame({
         'location': [e[0] for e in fastas],
         'idx': [e[0].split(' ')[0] for e in fastas],
@@ -321,10 +301,13 @@ def loadCounts(filename, maxCases, config):
     header = IN.readline()
     if type(header) is bytes:
         header = header.decode("utf-8")
-    if not rex.find("DNA=([,\d]+)\s+RNA=([,\d]+)", header):
+    if not rex.find("DNA=([,\\d]+)\\s+RNA=([,\\d]+)", header):
         raise Exception("Can't parse counts file header: " + header)
+
     DNAreps = [int(x) for x in rex[1].split(",")]
     RNAreps = [int(x) for x in rex[2].split(",")]
+    numTasks = len(DNAreps)
+
     linesRead = 0
     lines = []
     for line in IN:
@@ -332,13 +315,14 @@ def loadCounts(filename, maxCases, config):
             line = line.decode("utf-8")
         fields = line.rstrip().split()
         fields = [int(x) for x in fields]
-        if config.useCustomLoss:
-            lines.append(fields)
+        if (config.useCustomLoss):
+            lines.append(fields)  # keep raw counts
         else:
             lines.append(computeNaiveTheta(fields, DNAreps, RNAreps))
         linesRead += 1
-        if linesRead >= maxCases:
+        if (linesRead >= maxCases):
             break
+
     lines = np.array(lines)
     return (DNAreps, RNAreps, lines)
 
@@ -353,43 +337,41 @@ def computeNaiveTheta(line, DNAreps, RNAreps):
         DNA = line[a:b]
         RNA = line[b:c]
         avgX = sum(DNA) / DNAreps[i]
-        avgY = sum(RNA) / RNAreps[i]  # normalized data
+        avgY = sum(RNA) / RNAreps[i]
         naiveTheta = float(avgY) / float(avgX)
-        rec.append(tf.math.log(naiveTheta))  # log-scale
+        rec.append(tf.math.log(naiveTheta))  # log-scale target
         a = c
     return rec
 
 
-def prepare_input(setName, subdir, shouldRevComp, maxCases, config):
+def prepare_input(set, subdir, shouldRevComp, maxCases, config):
     # Convert sequences to one-hot encoding matrix
-    file_seq = str(subdir + "/" + setName + ".fasta.gz")
+    file_seq = str(subdir + "/" + set + ".fasta.gz")
     input_fasta_data_A = loadFasta(
         file_seq, uppercase=True, revcomp=shouldRevComp, stop_at=maxCases
     )
     sequence_length = len(input_fasta_data_A.sequence.iloc[0])
     seq_matrix_A = SequenceHelper.do_one_hot_encoding(
-        input_fasta_data_A.sequence,
-        sequence_length,
-        SequenceHelper.parse_alpha_to_seq
+        input_fasta_data_A.sequence, sequence_length, SequenceHelper.parse_alpha_to_seq
     )
+
     X = np.nan_to_num(seq_matrix_A)
     X_reshaped = X.reshape((X.shape[0], X.shape[1], X.shape[2]))
 
     (DNAreps, RNAreps, Y) = loadCounts(
-        subdir + "/" + setName + "-counts.txt.gz", maxCases, config
+        subdir + "/" + set + "-counts.txt.gz", maxCases, config
     )
-    global NUM_DNA, NUM_RNA
+
+    global NUM_DNA
+    global NUM_RNA
     NUM_DNA = DNAreps
     NUM_RNA = RNAreps
+
     matrix = pd.DataFrame(Y)
     matrix = tf.cast(matrix, tf.float32)
-    return (input_fasta_data_A.sequence, seq_matrix_A,
-            X_reshaped, matrix, input_fasta_data_A.idx)
+    return (input_fasta_data_A.sequence, seq_matrix_A, X_reshaped, matrix, input_fasta_data_A.idx)
 
 
-#=========================================================================
-#                               Model
-#=========================================================================
 def BuildModel(seqlen):
     # Input layer
     inputLayer = kl.Input(shape=(seqlen, 4))
@@ -399,27 +381,29 @@ def BuildModel(seqlen):
     skip = None
     for i in range(config.NumConv):
         skip = x
-        if config.KernelSizes[i] >= seqlen:
+        if (config.KernelSizes[i] >= seqlen):
             continue
         dilation = 1 if i == 0 else config.DilationFactor
-        if i > 0 and config.ConvDropout != 0:
+        if (i > 0 and config.ConvDropout != 0):
             x = Dropout(config.DropoutRate)(x)
-        x = kl.Conv1D(config.NumKernels[i],
-                      kernel_size=config.KernelSizes[i],
-                      padding=config.ConvPad,
-                      dilation_rate=dilation)(x)
+        x = kl.Conv1D(
+            config.NumKernels[i],
+            kernel_size=config.KernelSizes[i],
+            padding=config.ConvPad,
+            dilation_rate=dilation
+        )(x)
         x = BatchNormalization()(x)
         x = Activation('relu')(x)
         if (config.ConvResidualSkip != 0 and
                 i - 1 >= 0 and
                 config.NumKernels[i - 1] == config.NumKernels[i]):
             x = Add()([x, skip])
-        if config.ConvPoolSize > 1 and seqlen > config.ConvPoolSize:
+        if (config.ConvPoolSize > 1 and seqlen > config.ConvPoolSize):
             x = MaxPooling1D(config.ConvPoolSize)(x)
             seqlen /= config.ConvPoolSize
 
     # Optional Transformer encoder layers
-    if config.NumAttn > 0:
+    if (config.NumAttn > 0):
         x = x + keras_nlp.layers.RotaryEmbedding()(x)
     for i in range(config.NumAttn):
         skip = x
@@ -430,67 +414,74 @@ def BuildModel(seqlen):
             dropout=config.DropoutRate
         )(x)
         x = Dropout(config.DropoutRate)(x)
-        if config.AttnResidualSkip != 0:
+        if (config.AttnResidualSkip != 0):
             x = Add()([x, skip])
 
     # Global pooling
-    if config.GlobalMaxPool != 0:
+    if (config.GlobalMaxPool != 0):
         x = MaxPooling1D(int_shape(x)[1])(x)
-    if config.GlobalAvePool != 0:
+    if (config.GlobalAvePool != 0):
         x = AveragePooling1D(int_shape(x)[1])(x)
 
-    x = Flatten()(x)
+    # Flatten
+    if (config.Flatten != 0):
+        x = Flatten()(x)
 
-    # Dense trunk
-    if config.NumDense > 0:
+    # Dense layers
+    if (config.NumDense > 0):
         x = Dropout(config.DropoutRate)(x)
     for i in range(config.NumDense):
-        x = Dense(config.DenseSizes[i])(x)
+        x = kl.Dense(config.DenseSizes[i])(x)
         x = BatchNormalization()(x)
         x = Activation('relu')(x)
         x = Dropout(config.DropoutRate)(x)
 
-    # Single output: [mu_0, var_0_raw, mu_1, var_1_raw, ...]
-    numTasks = len(config.Tasks)
-    output_dim = 2 * numTasks
-    output = Dense(output_dim, activation='linear', name="mu_var")(x)
+    # Heads per task
+    tasks = config.Tasks
+    outputs = []
+    losses = []
+    weights = [float(x) for x in config.TaskWeights]
+    numTasks = len(tasks)
 
-    model = keras.models.Model(inputs=[inputLayer], outputs=output)
+    for i in range(numTasks):
+        task = tasks[i]
+        # IMPORTANT: predict log(theta_hat), so use linear head (NOT relu)
+        outputs.append(kl.Dense(1, activation='linear', name=task)(x))
+        loss = makeClosure(i) if config.useCustomLoss else "mse"
+        losses.append(loss)
+
+    model = keras.models.Model([inputLayer], outputs)
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=config.LearningRate),
-        loss=uncertainty_loss,
-        run_eagerly=True
+        keras.optimizers.Adam(learning_rate=config.LearningRate),
+        run_eagerly=True,
+        loss=losses,
+        loss_weights=weights
     )
     return model
 
 
-#=========================================================================
-#                               Training
-#=========================================================================
 def train(model, X_train, Y_train, X_valid, Y_valid):
     earlyStop = EarlyStopping(
         patience=config.EarlyStop,
         monitor="val_loss",
         restore_best_weights=True
     )
-
     history = model.fit(
-        X_train,
-        Y_train,
+        X_train, Y_train,
         verbose=config.Verbose,
         validation_data=(X_valid, Y_valid),
         batch_size=config.BatchSize,
         epochs=config.Epochs,
         callbacks=[earlyStop, History()]
     )
-    return model, history
+    return (model, history)
 
 
 #=========================================================================
 #                         Command Line Interface
 #=========================================================================
-if len(sys.argv) != 4:
-    exit(ProgramName.get() +
-         " <parms.config> <data-subdir> <out:model-filestem>\n")
+if (len(sys.argv) != 4):
+    exit(ProgramName.get() + " <parms.config> <data-subdir> <out:model-filestem>\n")
+
 (configFile, subdir, modelFilestem) = sys.argv[1:]
 main(configFile, subdir, modelFilestem)

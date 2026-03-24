@@ -159,22 +159,23 @@ def logGam(x):
 
 def sqError(sumX,numX,Yj,theta,alpha,beta,numRNA,sumDnaLibs,RnaLibs):
     Y=tf.reduce_sum(Yj,axis=1)
-    # print("Y=",Y)
+    #print("Y=",Y)
     n=numRNA
-    # print("n=",n)
+    #print("n=",n)
+    #print("L=",L)
     sumRnaLibs=tf.reduce_sum(RnaLibs,axis=1)
-    # print("sumRnaLibs=",sumRnaLibs)
+    #print("sumRnaLibs=",sumRnaLibs)
     X=sumX
-    # print("X=",X)
-    # print("theta=",theta)
+    #print("X=",X)
+    #print("theta=",theta)
     firstRatio=log(beta+sumDnaLibs)+logGam(alpha+Y+1)+logGam(alpha+X-1) -\
         ( log(beta+sumRnaLibs)+logGam(alpha+Y)+logGam(alpha+X) )
-    # print("firstRatio=",firstRatio)
+    #print("firstRatio=",firstRatio)
     secondRatio=2*log(beta+sumDnaLibs)+logGam(alpha+Y+2)+logGam(alpha+X-2) -\
         ( 2*log(sumRnaLibs)+logGam(alpha+Y)+logGam(alpha+X) )
-    # print("secondRatio=",secondRatio)
+    #print("secondRatio=",secondRatio)
     squaredError=theta*theta - 2*theta*exp(firstRatio) + exp(secondRatio)
-    # print("sqErr=",squaredError)
+    #print("sqErr=",squaredError)
     return squaredError
 
 @tf.autograph.experimental.do_not_convert
@@ -195,7 +196,6 @@ def makeClosure(taskNum):
         sumDnaLibs=tf.reduce_sum(DnaLibs,axis=1)
         se=sqError(sumX,b-a,RNA,y_pred,EPSILON,EPSILON,NUM_RNA[taskNum],
                    sumDnaLibs,RnaLibs)
-        # print(LL)
         return se
     return loss
 

@@ -38,17 +38,30 @@ def parse_cre_line(line: str) -> CRE:
     if not line:
         raise ValueError("Empty line encountered in CRE file")
     fields = line.split()  # tabs or spaces
+    # print(fields)
     region = fields[0]
-    chrom, coords = region.split(":")
-    beg, end = coords.split("-")
-    cre = CRE(chrom=chrom, begin=int(beg), end=int(end))
-    for field in fields[1:]:
-        # Pattern: 12345:ref=G:G,C,A,T
-        left, right = field.split(":ref=")
-        pos = int(left)
-        ref, alleles_csv = right.split(":")
-        alleles = alleles_csv.split(",")
+    if "-" in region:
+        # region = fields[0]
+        chrom, coords = region.split(":")
+        beg, end = coords.split("-")
+        cre = CRE(chrom=chrom, begin=int(beg), end=int(end))
+        for field in fields[1:]:   
+            left, right = field.split(":ref=")  # Pattern: 12345:ref=G:G,C,A,T
+            pos = int(left)
+            ref, alleles_csv = right.split(":")
+            alleles = alleles_csv.split(",")
+            cre.positions.append(CrePosition(pos=pos, ref=ref.upper(), alleles=[a.upper() for a in alleles]))
+    else:
+        # print(line)
+        chrom, loc, ref_allele, alt_allele = line.split(":")
+        pos=int(loc)
+        ref = ref_allele.split("=")[1]
+        alleles = alt_allele.split(",")
+        begin=pos-150
+        end=pos+150
+        cre = CRE(chrom=chrom, begin=begin, end=end)
         cre.positions.append(CrePosition(pos=pos, ref=ref.upper(), alleles=[a.upper() for a in alleles]))
+    
     return cre
 
 def load_cres(path: str, max_n: int = -1) -> List[CRE]:
@@ -166,8 +179,8 @@ def one_hot_batch(seqs: List[str]) -> np.ndarray:
         s = s.upper()
         for i, c in enumerate(s):
             k = ALPHABET.get(c)
-            if k is None:
-                raise ValueError(f"Invalid base {c!r} at position {i}")
+            # if k is None:
+            #     raise ValueError(f"Invalid base {c!r} at position {i}")
             X[j, i, k] = 1.0
     return X
 
@@ -242,10 +255,10 @@ def main():
                     raise ValueError(f"Position {pos} outside extracted window {it['chrom']}:{it['begin']}-{it['end']}")
                 ref_base = seq[local]
                 listed_ref = it["posrec"].ref
-                if ref_base != listed_ref:
-                    raise ValueError(
-                        f"Ref mismatch at {it['chrom']}:{pos}: genome={ref_base} vs listed ref={listed_ref}"
-                    )
+                # if ref_base != listed_ref:
+                #     raise ValueError(
+                #         f"Ref mismatch at {it['chrom']}:{pos}: genome={ref_base} vs listed ref={listed_ref}"
+                #     )
                 for allele in it["posrec"].alleles:
                     if allele not in ALPHABET:
                         continue
@@ -253,9 +266,11 @@ def main():
                     seqs_batch.append(alt_seq)
                     meta_batch.append((it["cre_id"], f"{it['chrom']}:{it['begin']}-{it['end']}", pos, ref_base, allele))
 
+                    pred_batch = 32
+
                     if len(seqs_batch) >= args.job_size:
                         X = one_hot_batch(seqs_batch)
-                        y = np.asarray(model.predict(X, batch_size=len(seqs_batch), verbose=0)).reshape((-1,))
+                        y = np.asarray(model.predict(X, batch_size=min(pred_batch, len(seqs_batch)), verbose=0)).reshape((-1,))
                         for (ID, actual, p, r, a), yhat in zip(meta_batch, y):
                             print(f"{ID}\t{actual}\tpos={p}\tref={r}\t{a}\t{float(yhat)}", file=out)
                         seqs_batch.clear(); meta_batch.clear()
